@@ -27,14 +27,18 @@
 # This file defines internal model for enc28j60
 # It's memory, registers etc
 
+import fcntl
+import os
+import tuntap
+
 class Device(object):
     COMMON_REGISTER_START = 0x1B
 
+    RTU_FRAME = 1500
 
-
-    def __init__(self):
+    def __init__(self, tap_dev="tap0"):
         # 0x0000 to 0x1FFF -- internal buffer
-        self._buffer = bytearray(4096)
+        self._buffer = bytearray(8192)
 
         # registers: 0x1B to 0x1F are common registers,
         # so 0x3B-0x3F, 0x5B-0x5F, 0x7B-0x7F are mapped to 0x1B-0x1F
@@ -42,18 +46,37 @@ class Device(object):
 
         self._rx_start = 0
         self._rx_ptr = 0
-        self._rx_size = 0
+        self._rx_end = 0
 
         self._tx_start = 0
         self._tx_ptr = 0
-        self._tx_size = 0
+        self._tx_end = 0
+
+        self._rx_rd_ptr = 0
+        self._rx_wr_ptr = 0
 
         # current state:
         self._spi_state = SPI_IDLE
         self._spi_reg = 0x00
         self._spi_data = 0xff
+
+        self._init_tap(tap_dev)
+        self._init_reg_callback()
+        self._rx_num = 0
+
         reset(self)
 
+    def _init_tap(self, dev):
+        f = tuntap.tap_open(dev)
+        fd = f.fileno()
+
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        self._tap = f
+
+    def clock(self):
+        self._rx_packet()
 
     # Low-level ops:
     def read_control_register(self, reg):
@@ -63,28 +86,35 @@ class Device(object):
         data = self._buffer[self._rx_ptr]
 
         self._rx_ptr += 1
-        if self._rx_ptr - self._rx_start >= self._rx_size:
-            self._rx_ptr = self._rx_size
+        if self._rx_ptr > self._rx_end:
+            self._rx_ptr = self._rx_start
 
         return data
 
     def write_control_register(self, reg, data):
         self._regs[self._get_register_addr(reg)] = data & 0xff
+        self._analyze_register_write(reg)
 
     def write_buffer_data(self, data):
         self._buffer[self._tx_ptr] = data & 0xff
 
         self._tx_ptr += 1
-        if self._tx_ptr - self._tx_start >= self._tx_size:
-            self._tx_ptr = self._tx_size
+        if self._tx_ptr > self._tx_end:
+            self._tx_ptr = self._tx_start
 
-    def bit_field_set(self, adr, data):
+    def bit_field_set(self, reg, data):
         mask = data & 0xff
         self._regs[self._get_register_addr(reg)] |= mask
+        self._analyze_register_write(reg)
 
-    def bit_field_clear(self, adr, data):
+    def bit_field_clear(self, reg, data):
         mask = ~(data & 0xff)
         self._regs[self._get_register_addr(reg)] &= mask
+        self._analyze_register_write(reg)
+
+    def soft_reset(self):
+        # set reset flag (as min)
+        pass
 
     def _get_register_addr(self, adr):
         if adr & 0x1f >= COMMON_REGISTER_START:
@@ -92,18 +122,20 @@ class Device(object):
         else:
             return adr & 0x7f
 
-    def soft_reset(self):
-        # set reset flag (as min)
-        pass
+    def _analyze_register_write(self, reg):
+        adr = self._get_register_addr(reg)
+        if adr in self._reg_callback:
+            self._reg_callback[adr]()
 
 
     # SPI interactions:
     # chip was selected (if cs = True)
     def spi_cs(self, cs):
         if cs and _spi_state == SPI_IDLE:
-            _spi_state = SPI_CMD
+            self._spi_state = SPI_CMD
         elif not cs:
-            _spi_state = SPI_IDLE
+            prev_spi_state = self._spi_state
+            self._spi_state = SPI_IDLE
 
     # recieve a byte from SPI (returns sended byte or None if can't send)
     def spi_rxtx(self, data):
@@ -224,6 +256,134 @@ class Device(object):
     CMD_RCR = 0x00 # mask
     CMD_BFS = 0x80 # mask
     CMD_BFC = 0xa0 # mask
+
+    def _init_reg_callback(self):
+        cb = {}
+        cb[0x1f] = _cb_ECON1
+        cb[0x1e] = _cb_ECON2
+
+        cb[0x60] = _cb_MAADR
+        cb[0x61] = _cb_MAADR
+        cb[0x62] = _cb_MAADR
+        cb[0x63] = _cb_MAADR
+        cb[0x64] = _cb_MAADR
+        cb[0x65] = _cb_MAADR
+
+        cb[0x00] = cb[0x01] = _cb_ERDPT
+        cb[0x08] = cb[0x09] = _cb_ERXST
+        cb[0x0a] = cb[0x0b] = _cb_ERXND
+
+        cb[0x0c] = cb[0x0d] = _cb_ERXRDPT
+        cb[0x0e] = cb[0x0f] = _cb_ERXWRPT
+
+        cb[0x02] = cb[0x03] = _cb_EWRPT
+        cb[0x04] = cb[0x05] = _cb_ETXST
+        cb[0x06] = cb[0x07] = _cb_ETXND
+
+        self._reg_callback = cb
+
+    def _cb_ECON1(self):
+        if self._regs[0x1f] & 0x08:
+            self._tx_packet()
+
+    def _cb_ECON2(self):
+        if self._regs[0x1e] & 0x40 and self._rx_num > 0:
+            self._rx_num -= 1
+
+
+    def _cb_MAADR(self):
+        self._mac_addr[0] = self.regs[0x61]
+        self._mac_addr[1] = self.regs[0x60]
+        self._mac_addr[2] = self.regs[0x63]
+        self._mac_addr[3] = self.regs[0x62]
+        self._mac_addr[4] = self.regs[0x65]
+        self._mac_addr[5] = self.regs[0x64]
+
+
+    def _cb_ERDPT(self):
+        self._rx_ptr = self._regs[0x01] << 8 | self._regs[0x00]
+
+    def _cb_ERXST(self):
+        self._rx_start = self._regs[0x09] << 8 | self._regs[0x08]
+
+    # including bounds?
+    def _cb_ERXND(self):
+        self._rx_end = self._regs[0x0b] << 8 | self._regs[0x0a]
+
+
+    def _cb_EWRPT(self):
+        self._tx_ptr = self._regs[0x03] << 8 | self._regs[0x02]
+
+    def _cb_ETXST(self):
+        self._tx_start = self._regs[0x05] << 8 | self._regs[0x04]
+
+    # including bounds?
+    def _cb_ETXND(self):
+        self._tx_end = self._regs[0x07] << 8 | self._regs[0x06]
+
+
+    def _cb_ERXRDPT(self):
+        self._rx_rd_ptr = self._regs[0x0d] << 8 | self._regs[0x0c]
+
+    def _cb_ERXWRPT(self):
+        self._rx_wr_ptr = self._regs[0x0f] << 8 | self._regs[0x0e]
+
+
+    def _tx_packet(self):
+        packet = self._buffer[self._tx_start+1:self._tx_end+1]
+        self._tap.write(packet)
+
+    def _rx_packet(self):
+        packet = bytearray(self._tap.read(RTU_FRAME))
+
+        if packet == None
+            pass
+
+        if self._regs[0x39] = 0xff:
+            pass
+
+        rxlen = len(packet)
+        ptr = self._rx_wr_ptr
+
+        if ptr & 0x01 != 0:
+            ptr += 1
+
+        ptr_next_raw = ptr + 6 + rxlen
+
+        if ptr_next_raw & 0x01 != 0:
+            ptr_next_raw += 1
+
+        ptr_next = ptr_next_raw
+        if ptr_next_raw > self._rx_end:
+            ptr_next = ptr_next_raw + self._rx_start - self._rx_end - 1
+
+        for i in range(6):
+            packet.insert(0, 0)
+
+        packet[0] = ptr_next & 0xff
+        packet[1] = (ptr_next >> 8) & 0xff
+        packet[2] = rxlen & 0xff
+        packet[3] = (rxlen >> 8) & 0xff
+        packet[4] = 0x80 # OK status ONLY
+        packet[5] = 0x00 #
+
+        if ptr < self._rx_rd_ptr and ptr_next < self._rx_rd_ptr:
+            write = True
+        elif ptr > self._rx_rd_ptr and ptr_next_raw <= self._rx_end:
+            write = True
+        elif ptr > self._rx_rd_ptr and ptr_next < self._rx_rd_ptr:
+            write = True
+        else:
+            write = False
+
+        if write:
+            self._regs[0x39] += 1
+            ptr_next_raw = ptr + 6 + rxlen
+            if ptr_next_raw <= self._rx_end:
+                self._buffer[ptr : ptr_next_raw] = packet
+            else:
+                self._buffer[ptr : self._rx_end + 1] = packet[0 : self._rx_end + 1 - ptr]
+                self._buffer[self._rx_start : ptr_next_raw + self._rx_start - self._rx_end - 1] = packet[self._rx_end + 1 - ptr : ]
 
 
 # vim:ts=4:sw=4:sts=4
