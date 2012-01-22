@@ -41,22 +41,28 @@ class Spi(object):
 
     # return so bit
     def clock(self, cs, si, sck):
-        if _is_re(self._cs, cs):
+        if self._is_re(self._cs, cs):
+            print "cs"
             self._dev.spi_cs(True)
-        elif _is_fe(self._cs, cs):
+        elif self._is_fe(self._cs, cs):
+            print "!cs"
             self._dev.spi_cs(False)
 
         if not cs:
             return True
 
-        if _is_re(self._sck, sck):
+        if self._is_re(self._sck, sck):
+            print "rd"
             self._read(si)
 
-        if _is_fe(self._sck, sck):
+        if self._is_fe(self._sck, sck):
+            print "wr"
             self._write()
 
         if self._tx_n == 8 and self._rx_n == 8:
-            self._tx = self._dev.spi_rxtx(self._rx)
+            tx = self._dev.spi_rxtx(self._rx)
+            print "tx:%02x rx:%02x" % (sel._tx, self._rx)
+            self._tx = tx
             self._rx_n = self._tx_n = 0
             self._rx = 0x00
 
@@ -90,11 +96,11 @@ class Spi(object):
         return res
 
     # is raising edge
-    def _is_re(old_pin, new_pin):
+    def _is_re(self, old_pin, new_pin):
         return not old_pin and new_pin
 
     # is falling edge
-    def _is_fe(old_pin, new_pin):
+    def _is_fe(self, old_pin, new_pin):
         return old_pin and not new_pin
 
 

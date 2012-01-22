@@ -32,9 +32,45 @@ import os
 import tuntap
 
 class Device(object):
+    # States:
+    #           idle - waiting for CS
+    SPI_IDLE = 0
+    #           cmd_wait - waiting for command
+    SPI_CMD = 1
+    #           reset - after SC command, don't respond at all
+    SPI_RESET = 2
+    #           rbm_data - waiting dummy byte to read from buffer
+    SPI_RBM = 3
+    #           wbm_data - waiting byte to write into buffer
+    SPI_WBM = 4
+    #           wcr/bfs/bfc_data - waiting data byte for corresponging command
+    SPI_WCR = 5
+    SPI_BFS = 6
+    SPI_BFC = 7
+    #           rcr_eth_data - waiting dummy byte to read command register
+    SPI_RCR_ETH = 8
+    #           rcr_mac/phy_dummy - waiting dummy byte when reading MAC/PHY register to return dummy byte
+    SPI_RCR_MACPHY_DUMMY = 9
+    #           rcr_mac/phy_data - waiting dummy byte to read MAC/PHY register
+    SPI_RCR_MACPHY = 10
+
+
+    # command code/mask
+    #           SC, RBM, WBM, WCR, BFS, BFC, RCR_ETH, RCR_MAC/PHY
+    CMD_SC = 0xff
+    CMD_RBM = 0x3a
+    CMD_WBM = 0x7a
+    CMD_WCR = 0x40 # mask
+    CMD_RCR = 0x00 # mask
+    CMD_BFS = 0x80 # mask
+    CMD_BFC = 0xa0 # mask
+
+
     COMMON_REGISTER_START = 0x1B
 
     RTU_FRAME = 1500
+
+
 
     def __init__(self, tap_dev="tap0"):
         # 0x0000 to 0x1FFF -- internal buffer
@@ -56,7 +92,7 @@ class Device(object):
         self._rx_wr_ptr = 0
 
         # current state:
-        self._spi_state = SPI_IDLE
+        self._spi_state = Device.SPI_IDLE
         self._spi_reg = 0x00
         self._spi_data = 0xff
 
@@ -64,7 +100,7 @@ class Device(object):
         self._init_reg_callback()
         self._rx_num = 0
 
-        reset(self)
+        #self.reset()
 
     def _init_tap(self, dev):
         f = tuntap.tap_open(dev)
@@ -131,82 +167,83 @@ class Device(object):
     # SPI interactions:
     # chip was selected (if cs = True)
     def spi_cs(self, cs):
-        if cs and _spi_state == SPI_IDLE:
-            self._spi_state = SPI_CMD
+        if cs and self._spi_state == Device.SPI_IDLE:
+            self._spi_state = Device.SPI_CMD
         elif not cs:
             prev_spi_state = self._spi_state
-            self._spi_state = SPI_IDLE
+            self._spi_state = Device.SPI_IDLE
 
     # recieve a byte from SPI (returns sended byte or None if can't send)
     def spi_rxtx(self, data):
         spi_data = self._spi_data
-        self._spi_parse_state(data)
+        self._spi_data = self._spi_parse_state(data)
+        print "rx:%02x tx:%02x" % (data, spi_data)
         return spi_data
 
     def _spi_parse_state(self, data):
-        if self._spi_state == SPI_IDLE:
+        if self._spi_state == Device.SPI_IDLE:
             pass
-        elif self._spi_state == SPI_CMD:
+        elif self._spi_state == Device.SPI_CMD:
             return self._spi_parse_cmd(data)
-        elif self._spi_state == SPI_RESET:
-            self._spi_state = SPI_IDLE
-        elif self._spi_state == SPI_RBM:
+        elif self._spi_state == Device.SPI_RESET:
+            self._spi_state = Device.SPI_IDLE
+        elif self._spi_state == Device.SPI_RBM:
             return self.read_buffer_data()
-        elif self._spi_state == SPI_WBM:
+        elif self._spi_state == Device.SPI_WBM:
             self.write_buffer_data(data)
             return 0xff
-        elif self._spi_state == SPI_WCR:
+        elif self._spi_state == Device.SPI_WCR:
             self.write_control_register(self._spi_reg, data)
-            self._spi_state = SPI_CMD
+            self._spi_state = Device.SPI_CMD
             return 0xff
-        elif self._spi_state == SPI_BFS:
+        elif self._spi_state == Device.SPI_BFS:
             self.bit_field_set(self._spi_reg, data)
-            self._spi_state = SPI_CMD
+            self._spi_state = Device.SPI_CMD
             return 0xff
-        elif self._spi_state == SPI_BFC:
+        elif self._spi_state == Device.SPI_BFC:
             self.bit_field_clear(self._spi_reg, data)
-            self._spi_state = SPI_CMD
+            self._spi_state = Device.SPI_CMD
             return 0xff
-        elif self._spi_state == SPI_RCR_ETH:
-            self._spi_state = SPI_CMD
+        elif self._spi_state == Device.SPI_RCR_ETH:
+            self._spi_state = Device.SPI_CMD
             return 0xff
-        elif self._spi_state == SPI_RCR_MACPHY_DUMMY:
-            self._spi_state = SPI_RCR_MACPHY
+        elif self._spi_state == Device.SPI_RCR_MACPHY_DUMMY:
+            self._spi_state = Device.SPI_RCR_MACPHY
             return self.read_control_register(self._spi_reg)
-        elif self._spi_state == SPI_RCR_MACPHY:
-            self._spi_state = SPI_CMD
+        elif self._spi_state == Device.SPI_RCR_MACPHY:
+            self._spi_state = Device.SPI_CMD
             return 0xff
 
     def _spi_parse_cmd(self, data):
-        if data == CMD_SC:
-            self._spi_state = SPI_RESET
+        if data == Device.CMD_SC:
+            self._spi_state = Device.SPI_RESET
             self.soft_reset()
             return 0xff
-        elif data == CMD_RBM:
-            self._spi_state = SPI_RBM
+        elif data == Device.CMD_RBM:
+            self._spi_state = Device.SPI_RBM
             return self.read_buffer_data()
-        elif data == CMD_WBR:
-            self._spi_state = SPI_WBM
+        elif data == Device.CMD_WBR:
+            self._spi_state = Device.SPI_WBM
             return 0xff
-        elif data & 0xe0 == CMD_WCR:
+        elif data & 0xe0 == Device.CMD_WCR:
             self._spi_reg = self._get_current_bank() | (data & 0x1f)
-            self._spi_state = SPI_WCR
+            self._spi_state = Device.SPI_WCR
             return 0xff
-        elif data & 0xe0 == CMD_BFS:
+        elif data & 0xe0 == Device.CMD_BFS:
             self._spi_reg = self._get_current_bank() | (data & 0x1f)
-            self._spi_state = SPI_BFS
+            self._spi_state = Device.SPI_BFS
             return 0xff
-        elif data & 0xe0 == CMD_BFC:
+        elif data & 0xe0 == Device.CMD_BFC:
             self._spi_reg = self._get_current_bank() | (data & 0x1f)
-            self._spi_state = SPI_BFC
+            self._spi_state = Device.SPI_BFC
             return 0xff
-        elif data & 0xe0 == CMD_RCR:
+        elif data & 0xe0 == Device.CMD_RCR:
             self._spi_reg = self._get_current_bank() | (data & 0x1f)
             if self._is_macphy_reg(self._spi_reg):
-                self._spi_state = SPI_RCR_MACPHY_DUMMY
+                self._spi_state = Device.SPI_RCR_MACPHY_DUMMY
                 return 0xff
             else:
-                self._spi_state = SPI_RCR_ETH
+                self._spi_state = Device.SPI_RCR_ETH
                 return self.read_control_register(self._spi_reg)
 
         raise Exception('unknown command')
@@ -224,61 +261,28 @@ class Device(object):
         else:
             return False
 
-    # States:
-    #           idle - waiting for CS
-    SPI_IDLE = 0
-    #           cmd_wait - waiting for command
-    SPI_CMD = 1
-    #           reset - after SC command, don't respond at all
-    SPI_RESET = 2
-    #           rbm_data - waiting dummy byte to read from buffer
-    SPI_RBM = 3
-    #           wbm_data - waiting byte to write into buffer
-    SPI_WBM = 4
-    #           wcr/bfs/bfc_data - waiting data byte for corresponging command
-    SPI_WCR = 5
-    SPI_BFS = 6
-    SPI_BFC = 7
-    #           rcr_eth_data - waiting dummy byte to read command register
-    SPI_RCR_ETH = 8
-    #           rcr_mac/phy_dummy - waiting dummy byte when reading MAC/PHY register to return dummy byte
-    SPI_RCR_MACPHY_DUMMY = 9
-    #           rcr_mac/phy_data - waiting dummy byte to read MAC/PHY register
-    SPI_RCR_MACPHY = 10
-
-
-    # command code/mask
-    #           SC, RBM, WBM, WCR, BFS, BFC, RCR_ETH, RCR_MAC/PHY
-    CMD_SC = 0xff
-    CMD_RBM = 0x3a
-    CMD_WBM = 0x7a
-    CMD_WCR = 0x40 # mask
-    CMD_RCR = 0x00 # mask
-    CMD_BFS = 0x80 # mask
-    CMD_BFC = 0xa0 # mask
-
     def _init_reg_callback(self):
         cb = {}
-        cb[0x1f] = _cb_ECON1
-        cb[0x1e] = _cb_ECON2
+        cb[0x1f] = Device._cb_ECON1
+        cb[0x1e] = Device._cb_ECON2
 
-        cb[0x60] = _cb_MAADR
-        cb[0x61] = _cb_MAADR
-        cb[0x62] = _cb_MAADR
-        cb[0x63] = _cb_MAADR
-        cb[0x64] = _cb_MAADR
-        cb[0x65] = _cb_MAADR
+        cb[0x60] = Device._cb_MAADR
+        cb[0x61] = Device._cb_MAADR
+        cb[0x62] = Device._cb_MAADR
+        cb[0x63] = Device._cb_MAADR
+        cb[0x64] = Device._cb_MAADR
+        cb[0x65] = Device._cb_MAADR
 
-        cb[0x00] = cb[0x01] = _cb_ERDPT
-        cb[0x08] = cb[0x09] = _cb_ERXST
-        cb[0x0a] = cb[0x0b] = _cb_ERXND
+        cb[0x00] = cb[0x01] = Device._cb_ERDPT
+        cb[0x08] = cb[0x09] = Device._cb_ERXST
+        cb[0x0a] = cb[0x0b] = Device._cb_ERXND
 
-        cb[0x0c] = cb[0x0d] = _cb_ERXRDPT
-        cb[0x0e] = cb[0x0f] = _cb_ERXWRPT
+        cb[0x0c] = cb[0x0d] = Device._cb_ERXRDPT
+        cb[0x0e] = cb[0x0f] = Device._cb_ERXWRPT
 
-        cb[0x02] = cb[0x03] = _cb_EWRPT
-        cb[0x04] = cb[0x05] = _cb_ETXST
-        cb[0x06] = cb[0x07] = _cb_ETXND
+        cb[0x02] = cb[0x03] = Device._cb_EWRPT
+        cb[0x04] = cb[0x05] = Device._cb_ETXST
+        cb[0x06] = cb[0x07] = Device._cb_ETXND
 
         self._reg_callback = cb
 
@@ -334,12 +338,14 @@ class Device(object):
         self._tap.write(packet)
 
     def _rx_packet(self):
-        packet = bytearray(self._tap.read(RTU_FRAME))
+        packet = self._tap.read(Device.RTU_FRAME)
 
-        if packet == None
-            pass
+        if packet is None:
+            return
 
-        if self._regs[0x39] = 0xff:
+        packet = bytearray(packet)
+
+        if self._regs[0x39] == 0xff:
             pass
 
         rxlen = len(packet)
